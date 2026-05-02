@@ -1,0 +1,361 @@
+package com.makomi.item;
+
+import com.makomi.data.LinkItemData;
+import com.makomi.data.LinkNodeRetireEvents;
+import com.makomi.data.LinkNodeType;
+import com.makomi.data.RepeaterItemData;
+import com.makomi.data.SmartNodeContainerData;
+import com.makomi.data.SmartNodeContainerPlacementType;
+import com.makomi.data.SmartNodeContainerRecoverySupport;
+import java.util.ArrayList;
+import com.makomi.menu.SmartNodeContainerMenu;
+import com.makomi.registry.ModItems;
+import java.util.List;
+import net.minecraft.ChatFormatting;
+import net.minecraft.core.HolderLookup;
+import net.minecraft.core.NonNullList;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.InteractionResultHolder;
+import net.minecraft.world.SimpleMenuProvider;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.TooltipFlag;
+import net.minecraft.world.item.context.BlockPlaceContext;
+import net.minecraft.world.item.context.UseOnContext;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.BlockHitResult;
+
+/**
+ * 智能节点容器物品。
+ * <p>
+ * 物品职责：
+ * </p>
+ * <ul>
+ *   <li>`B` 键打开箱子式库存；</li>
+ *   <li>鼠标中键切换当前放置类型；</li>
+ *   <li>主手右键从容器中按当前类型弹出一个节点并尝试放置。</li>
+ * </ul>
+ */
+public class SmartNodeContainerItem extends Item {
+	public SmartNodeContainerItem(Item.Properties properties) {
+		super(properties);
+	}
+
+	@Override
+	public InteractionResultHolder<ItemStack> use(Level level, Player player, InteractionHand hand) {
+		return InteractionResultHolder.pass(player.getItemInHand(hand));
+	}
+
+	@Override
+	public InteractionResult useOn(UseOnContext context) {
+		Player player = context.getPlayer();
+		if (player == null || context.getHand() != InteractionHand.MAIN_HAND) {
+			return InteractionResult.PASS;
+		}
+		Level level = context.getLevel();
+		ItemStack containerStack = context.getItemInHand();
+		BlockState clickedState = level.getBlockState(context.getClickedPos());
+		BlockEntity clickedBlockEntity = level.getBlockEntity(context.getClickedPos());
+		if (player.isShiftKeyDown() && SmartNodeContainerRecoverySupport.isRecoverableNode(clickedState, clickedBlockEntity)) {
+			return tryRecoverNode(context, player, containerStack, clickedState, clickedBlockEntity);
+		}
+		if (player.isShiftKeyDown() && isDropOnlyTarget(clickedState, clickedBlockEntity)) {
+			return tryDropConfiguredBlock(context, player, containerStack, clickedState, clickedBlockEntity);
+		}
+
+		SmartNodeContainerData.Snapshot snapshot = SmartNodeContainerData.read(containerStack);
+		if (!snapshot.hasItems()) {
+			return InteractionResult.PASS;
+		}
+		if (level.isClientSide) {
+			return InteractionResult.SUCCESS;
+		}
+		if (!(level instanceof ServerLevel serverLevel)) {
+			return InteractionResult.PASS;
+		}
+
+		NonNullList<ItemStack> contents = SmartNodeContainerData.readContents(containerStack, serverLevel.registryAccess());
+		int selectedSlotIndex = SmartNodeContainerData.resolvePreferredSlotForType(
+			contents,
+			snapshot.selectedType(),
+			snapshot.temporarySelectedSlotIndex()
+		);
+		if (selectedSlotIndex < 0) {
+			return InteractionResult.PASS;
+		}
+
+		ItemStack storedStack = contents.get(selectedSlotIndex);
+		if (!(storedStack.getItem() instanceof BlockItem blockItem)) {
+			return InteractionResult.PASS;
+		}
+		ensureNestedNodeSerial(serverLevel, storedStack);
+		boolean shouldConsumeOnPlacement = shouldConsumeOnPlacement(player, snapshot);
+		ItemStack nestedStack = storedStack.copy();
+		UseOnContext nestedContext = new UseOnContext(
+			level,
+			player,
+			context.getHand(),
+			nestedStack,
+			new BlockHitResult(context.getClickLocation(), context.getClickedFace(), context.getClickedPos(), false)
+		);
+		InteractionResult result = blockItem.place(new BlockPlaceContext(nestedContext));
+		if (!result.consumesAction()) {
+			return result;
+		}
+
+		if (shouldConsumeOnPlacement) {
+			contents.set(
+				selectedSlotIndex,
+				resolveConsumedSlotReplacement(nestedStack, player.getAbilities().instabuild)
+			);
+		}
+		if (snapshot.autoSortEnabled()) {
+			contents = SmartNodeContainerData.sortContents(contents);
+		}
+		SmartNodeContainerData.write(
+			containerStack,
+			serverLevel.registryAccess(),
+			contents,
+			snapshot.selectedType(),
+			snapshot.autoSortEnabled(),
+			snapshot.creativeAutoConsumeEnabled(),
+			-1
+		);
+		player.containerMenu.broadcastChanges();
+		return result;
+	}
+
+	@Override
+	public void inventoryTick(ItemStack stack, Level level, Entity entity, int slotId, boolean isSelected) {
+		SmartNodeContainerData.syncModelState(stack);
+		super.inventoryTick(stack, level, entity, slotId, isSelected);
+	}
+
+	@Override
+	public void onDestroyed(ItemEntity itemEntity) {
+		LinkNodeRetireEvents.markDamageDiscard(itemEntity);
+		super.onDestroyed(itemEntity);
+	}
+
+	@Override
+	public void appendHoverText(
+		ItemStack stack,
+		Item.TooltipContext context,
+		List<Component> tooltipComponents,
+		TooltipFlag tooltipFlag
+	) {
+		CreativeTooltipOriginSupport.appendRedstoneLinkOriginLineIfNeeded(stack, tooltipComponents, tooltipFlag);
+		SmartNodeContainerData.Snapshot snapshot = SmartNodeContainerData.read(stack);
+		tooltipComponents.add(
+			Component.translatable(
+				"tooltip.redstonelink.smart_node_container.current_type",
+				Component.translatable(snapshot.selectedType().translationKey())
+			)
+		);
+		tooltipComponents.add(
+			Component.translatable(
+				"tooltip.redstonelink.smart_node_container.item_count",
+				Integer.toString(snapshot.itemCount())
+			)
+		);
+		tooltipComponents.add(
+			Component.translatable(
+				"tooltip.redstonelink.smart_node_container.auto_sort",
+				Component.translatable(
+					snapshot.autoSortEnabled()
+						? "screen.redstonelink.smart_node_container.toggle.on"
+						: "screen.redstonelink.smart_node_container.toggle.off"
+				)
+			)
+		);
+		tooltipComponents.add(
+			Component.translatable(
+				"tooltip.redstonelink.smart_node_container.creative_auto_consume",
+				Component.translatable(
+					snapshot.creativeAutoConsumeEnabled()
+						? "screen.redstonelink.smart_node_container.toggle.on"
+						: "screen.redstonelink.smart_node_container.toggle.off"
+				)
+			)
+		);
+		tooltipComponents.add(Component.translatable("tooltip.redstonelink.smart_node_container.temporary_select"));
+		tooltipComponents.add(Component.translatable("tooltip.redstonelink.smart_node_container.open"));
+		tooltipComponents.add(Component.translatable("tooltip.redstonelink.smart_node_container.cycle_type"));
+		tooltipComponents.add(Component.translatable("tooltip.redstonelink.smart_node_container.place"));
+		tooltipComponents.add(Component.translatable("tooltip.redstonelink.smart_node_container.recover"));
+		tooltipComponents.add(Component.translatable("tooltip.redstonelink.smart_node_container.drop_configured_blocks"));
+		tooltipComponents.add(
+			Component.translatable("tooltip.redstonelink.smart_node_container.connection_sync_notice").withStyle(ChatFormatting.GRAY)
+		);
+		super.appendHoverText(stack, context, tooltipComponents, tooltipFlag);
+	}
+
+	/**
+	 * 打开主手持有的智能节点容器。
+	 */
+	public static void openHeldMenu(ServerPlayer player) {
+		if (player == null) {
+			return;
+		}
+		ItemStack mainHandStack = player.getMainHandItem();
+		if (mainHandStack.isEmpty() || mainHandStack.getItem() != ModItems.SMART_NODE_CONTAINER) {
+			return;
+		}
+		player.openMenu(
+			new SimpleMenuProvider(
+				(containerId, inventory, ignoredPlayer) -> new SmartNodeContainerMenu(containerId, inventory, inventory.selected),
+				Component.translatable("screen.redstonelink.smart_node_container.title")
+			)
+		);
+	}
+
+	private static void ensureNestedNodeSerial(ServerLevel level, ItemStack nestedStack) {
+		if (level == null || nestedStack == null || nestedStack.isEmpty()) {
+			return;
+		}
+		if (nestedStack.getItem() == ModItems.LINK_REPEATER) {
+			RepeaterItemData.ensureSerial(nestedStack, level);
+			return;
+		}
+		if (nestedStack.getItem() instanceof PairableItem pairableItem) {
+			LinkNodeType nodeType = pairableItem.getNodeType();
+			LinkItemData.ensureSerial(nestedStack, level, nodeType);
+		}
+	}
+
+	/**
+	 * 潜行时优先尝试把命中的节点方块受控回收到当前容器。
+	 */
+	private static InteractionResult tryRecoverNode(
+		UseOnContext context,
+		Player player,
+		ItemStack containerStack,
+		BlockState clickedState,
+		BlockEntity clickedBlockEntity
+	) {
+		if (context.getLevel().isClientSide) {
+			return InteractionResult.SUCCESS;
+		}
+		if (!(context.getLevel() instanceof ServerLevel serverLevel)) {
+			return InteractionResult.FAIL;
+		}
+		SmartNodeContainerData.Snapshot snapshot = SmartNodeContainerData.read(containerStack);
+		NonNullList<ItemStack> contents = SmartNodeContainerData.readContents(containerStack, serverLevel.registryAccess());
+		SmartNodeContainerRecoverySupport.RecoveryResult recoveryResult = SmartNodeContainerRecoverySupport.recoverNodeIntoContainer(
+			serverLevel,
+			player,
+			containerStack,
+			contents,
+			context.getClickedPos(),
+			clickedState,
+			clickedBlockEntity
+		);
+		if (!recoveryResult.recovered()) {
+			return InteractionResult.FAIL;
+		}
+		NonNullList<ItemStack> updatedContents = snapshot.autoSortEnabled()
+			? SmartNodeContainerData.sortContents(recoveryResult.updatedContents())
+			: recoveryResult.updatedContents();
+		SmartNodeContainerData.write(
+			containerStack,
+			serverLevel.registryAccess(),
+			updatedContents,
+			snapshot.selectedType(),
+			snapshot.autoSortEnabled(),
+			snapshot.creativeAutoConsumeEnabled(),
+			snapshot.temporarySelectedSlotIndex()
+		);
+		player.containerMenu.broadcastChanges();
+		if (player instanceof ServerPlayer serverPlayer) {
+			serverPlayer.displayClientMessage(
+				Component.translatable(
+					"message.redstonelink.smart_node_container.recovered",
+					Integer.toString(recoveryResult.insertedCount()),
+					Integer.toString(recoveryResult.droppedCount())
+				),
+				true
+			);
+		}
+		return InteractionResult.SUCCESS;
+	}
+
+	/**
+	 * 解析本次放置是否应消耗容器内节点。
+	 */
+	private static boolean shouldConsumeOnPlacement(Player player, SmartNodeContainerData.Snapshot snapshot) {
+		if (player == null || snapshot == null) {
+			return true;
+		}
+		if (!player.getAbilities().instabuild) {
+			return true;
+		}
+		return snapshot.creativeAutoConsumeEnabled();
+	}
+
+	/**
+	 * 解析“本次放置已确认成功且需要消费”后，容器槽位应保留的物品状态。
+	 * <p>
+	 * 生存模式沿用 `BlockItem.place(...)` 对临时物品栈的真实改写结果；
+	 * 创造模式下由于 `instabuild` 不会减少临时物品栈，因此这里显式清空槽位，
+	 * 让“创造自动消耗”开关具备真实的节点扣减效果。
+	 * </p>
+	 */
+	static ItemStack resolveConsumedSlotReplacement(ItemStack nestedStack, boolean creativeInstabuild) {
+		if (creativeInstabuild) {
+			return ItemStack.EMPTY;
+		}
+		return nestedStack == null || nestedStack.isEmpty() ? ItemStack.EMPTY : nestedStack;
+	}
+
+	/**
+	 * 判断当前命中的方块是否属于“只掉落、不回收”的受控对象。
+	 */
+	private static boolean isDropOnlyTarget(BlockState state, BlockEntity blockEntity) {
+		return blockEntity instanceof com.makomi.block.entity.AbstractLinkFilterBlockEntity
+			|| blockEntity instanceof com.makomi.block.entity.LinkChunkActivatorBlockEntity;
+	}
+
+	/**
+	 * 潜行主手右键过滤器或区块激活器时，直接按真实掉落链掉出物品，不写入容器。
+	 */
+	private static InteractionResult tryDropConfiguredBlock(
+		UseOnContext context,
+		Player player,
+		ItemStack containerStack,
+		BlockState clickedState,
+		BlockEntity clickedBlockEntity
+	) {
+		if (context.getLevel().isClientSide) {
+			return InteractionResult.SUCCESS;
+		}
+		if (!(context.getLevel() instanceof ServerLevel serverLevel)) {
+			return InteractionResult.FAIL;
+		}
+		List<ItemStack> resolvedDrops = new ArrayList<>(
+			Block.getDrops(clickedState, serverLevel, context.getClickedPos(), clickedBlockEntity, player, containerStack.copy())
+		);
+		if (resolvedDrops.isEmpty()) {
+			return InteractionResult.FAIL;
+		}
+		if (!serverLevel.removeBlock(context.getClickedPos(), false)) {
+			return InteractionResult.FAIL;
+		}
+		for (ItemStack resolvedDrop : resolvedDrops) {
+			if (resolvedDrop != null && !resolvedDrop.isEmpty()) {
+				Block.popResource(serverLevel, context.getClickedPos(), resolvedDrop);
+			}
+		}
+		return InteractionResult.SUCCESS;
+	}
+}

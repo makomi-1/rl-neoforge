@@ -1,0 +1,628 @@
+package com.makomi.network;
+
+import com.makomi.config.RedstoneLinkConfig;
+import com.makomi.data.CrossChunkNodeIdentity;
+import com.makomi.data.LinkGuiDisplayContext;
+import com.makomi.data.LinkConnectionMode;
+import com.makomi.data.LinkNodeType;
+import com.makomi.data.NodeLinksSnapshot;
+import com.makomi.util.SignalStrengths;
+import java.util.ArrayList;
+import java.util.List;
+import net.minecraft.network.FriendlyByteBuf;
+import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+
+/**
+ * `PairingNetwork` 的 payload 编解码与构造辅助。
+ * <p>
+ * 该 helper 只负责字节级编解码与 payload 形态适配，不承担注册或服务端查询职责。
+ * </p>
+ */
+final class PairingNetworkPayloadSupport {
+	static final int DIMENSION_KEY_MAX_LENGTH = 128;
+	static final int NODE_TYPE_MAX_LENGTH = 32;
+	private static final int CROSS_CHUNK_IDENTITY_TOKEN_MAX_LENGTH = 32;
+	private static final int DISPLAY_CONTEXT_TOKEN_MAX_LENGTH = 64;
+	private static final int MODE_TOKEN_MAX_LENGTH = 16;
+	private static final int ALIAS_TEXT_MAX_LENGTH = 96;
+	private static final int DISPLAY_TEXT_MAX_LENGTH = 96;
+	private static final int FEEDBACK_MESSAGE_KEY_MAX_LENGTH = 256;
+	private static final int FEEDBACK_MESSAGE_ARG_MAX_LENGTH = 512;
+
+	private PairingNetworkPayloadSupport() {
+	}
+
+	/**
+	 * 按来源类型构建打开配对界面的回包。
+	 *
+	 * @param sourceType 来源节点类型
+	 * @param sourceSerial 来源序列号
+	 * @param currentTargets 当前可见目标序号
+	 * @return 对应来源类型的 payload
+	 */
+	static CustomPacketPayload buildPayloadForSourceType(
+		LinkNodeType sourceType,
+		long sourceSerial,
+		NodeLinksSnapshot linksSnapshot,
+		LinkConnectionMode connectionMode,
+		long channel,
+		String displayContextToken,
+		String sourceAlias,
+		String sourceDisplayText
+	) {
+		NodeLinksSnapshot normalizedSnapshot = linksSnapshot == null
+			? new NodeLinksSnapshot(null, List.of(), false)
+			: linksSnapshot;
+		if (sourceType == LinkNodeType.TRIGGER_SOURCE) {
+			return new PairingNetwork.OpenTriggerSourcePairingPayload(
+				sourceSerial,
+				normalizedSnapshot.visibleTargets(),
+				normalizedSnapshot.visibleTargetDisplayTexts(),
+				normalizedSnapshot.graphRevision(),
+				normalizedSnapshot.sourceRevision(),
+				normalizedSnapshot.coreRevision(),
+				connectionMode == null ? LinkConnectionMode.SERIAL.token() : connectionMode.token(),
+				channel,
+				LinkGuiDisplayContext.normalizePairingContextToken(displayContextToken, LinkNodeType.TRIGGER_SOURCE),
+				sourceAlias,
+				sourceDisplayText
+			);
+		}
+		return new PairingNetwork.OpenCorePairingPayload(
+			sourceSerial,
+			normalizedSnapshot.visibleTargets(),
+			normalizedSnapshot.visibleTargetDisplayTexts(),
+			normalizedSnapshot.graphRevision(),
+			normalizedSnapshot.sourceRevision(),
+			normalizedSnapshot.coreRevision(),
+			connectionMode == null ? LinkConnectionMode.SERIAL.token() : connectionMode.token(),
+			channel,
+			LinkGuiDisplayContext.normalizePairingContextToken(displayContextToken, LinkNodeType.CORE),
+			sourceAlias,
+			sourceDisplayText
+		);
+	}
+
+	/**
+	 * 编码通用配对 payload。
+	 */
+	static void encodePairingPayload(
+		FriendlyByteBuf buffer,
+		long sourceSerial,
+		List<Long> targets,
+		List<String> targetDisplayTexts,
+		long graphRevision,
+		long sourceRevision,
+		long coreRevision,
+		String connectionModeToken,
+		long channel,
+		String displayContextToken,
+		String sourceAlias,
+		String sourceDisplayText
+	) {
+		buffer.writeVarLong(sourceSerial);
+		buffer.writeVarInt(targets.size());
+		for (long target : targets) {
+			buffer.writeVarLong(target);
+		}
+		writeDisplayTexts(buffer, targetDisplayTexts);
+		buffer.writeVarLong(Math.max(0L, graphRevision));
+		buffer.writeVarLong(Math.max(0L, sourceRevision));
+		buffer.writeVarLong(Math.max(0L, coreRevision));
+		buffer.writeUtf(LinkConnectionMode.fromToken(connectionModeToken).token(), MODE_TOKEN_MAX_LENGTH);
+		buffer.writeVarLong(Math.max(0L, channel));
+		buffer.writeUtf(displayContextToken == null ? "" : displayContextToken, DISPLAY_CONTEXT_TOKEN_MAX_LENGTH);
+		buffer.writeUtf(sourceAlias == null ? "" : sourceAlias, ALIAS_TEXT_MAX_LENGTH);
+		buffer.writeUtf(sourceDisplayText == null ? "" : sourceDisplayText, DISPLAY_TEXT_MAX_LENGTH);
+	}
+
+	/**
+	 * 解码触发源配对 payload。
+	 */
+	static PairingNetwork.OpenTriggerSourcePairingPayload decodeTriggerSourcePairingPayload(FriendlyByteBuf buffer) {
+		DecodedPayload payload = decodePairingPayload(buffer);
+		return new PairingNetwork.OpenTriggerSourcePairingPayload(
+			payload.sourceSerial(),
+			payload.targets(),
+			payload.targetDisplayTexts(),
+			payload.graphRevision(),
+			payload.sourceRevision(),
+			payload.coreRevision(),
+			payload.connectionModeToken(),
+			payload.channel(),
+			payload.displayContextToken(),
+			payload.sourceAlias(),
+			payload.sourceDisplayText()
+		);
+	}
+
+	/**
+	 * 解码 core 配对 payload。
+	 */
+	static PairingNetwork.OpenCorePairingPayload decodeCorePairingPayload(FriendlyByteBuf buffer) {
+		DecodedPayload payload = decodePairingPayload(buffer);
+		return new PairingNetwork.OpenCorePairingPayload(
+			payload.sourceSerial(),
+			payload.targets(),
+			payload.targetDisplayTexts(),
+			payload.graphRevision(),
+			payload.sourceRevision(),
+			payload.coreRevision(),
+			payload.connectionModeToken(),
+			payload.channel(),
+			payload.displayContextToken(),
+			payload.sourceAlias(),
+			payload.sourceDisplayText()
+		);
+	}
+
+	/**
+	 * 编码 triggerSource 配对提交包。
+	 */
+	static void encodeSubmitTriggerSourcePairingPayload(
+		FriendlyByteBuf buffer,
+		long sourceSerial,
+		String connectionModeToken,
+		String targetsExpression,
+		long channel,
+		long expectedSourceRevision
+	) {
+		encodeSubmitPairingExpressionPayload(buffer, sourceSerial, connectionModeToken, targetsExpression, channel, expectedSourceRevision);
+	}
+
+	/**
+	 * 解码 triggerSource 配对提交包。
+	 */
+	static PairingNetwork.SubmitTriggerSourcePairingPayload decodeSubmitTriggerSourcePairingPayload(FriendlyByteBuf buffer) {
+		DecodedSubmitPairingPayload payload = decodeSubmitPairingExpressionPayload(buffer);
+		return new PairingNetwork.SubmitTriggerSourcePairingPayload(
+			payload.serial(),
+			payload.connectionModeToken(),
+			payload.expression(),
+			payload.channel(),
+			payload.expectedRevision()
+		);
+	}
+
+	/**
+	 * 编码 core 配对提交包。
+	 */
+	static void encodeSubmitCorePairingPayload(
+		FriendlyByteBuf buffer,
+		long coreSerial,
+		String connectionModeToken,
+		String triggerSourceExpression,
+		long channel,
+		long expectedCoreRevision
+	) {
+		encodeSubmitPairingExpressionPayload(buffer, coreSerial, connectionModeToken, triggerSourceExpression, channel, expectedCoreRevision);
+	}
+
+	/**
+	 * 解码 core 配对提交包。
+	 */
+	static PairingNetwork.SubmitCorePairingPayload decodeSubmitCorePairingPayload(FriendlyByteBuf buffer) {
+		DecodedSubmitPairingPayload payload = decodeSubmitPairingExpressionPayload(buffer);
+		return new PairingNetwork.SubmitCorePairingPayload(
+			payload.serial(),
+			payload.connectionModeToken(),
+			payload.expression(),
+			payload.channel(),
+			payload.expectedRevision()
+		);
+	}
+
+	/**
+	 * 编码 pairing GUI 别名保存提交包。
+	 */
+	static void encodeSubmitPairingAliasPayload(FriendlyByteBuf buffer, String sourceType, long sourceSerial, String sourceAlias) {
+		buffer.writeUtf(sourceType == null ? "" : sourceType, NODE_TYPE_MAX_LENGTH);
+		buffer.writeVarLong(Math.max(0L, sourceSerial));
+		buffer.writeUtf(sourceAlias == null ? "" : sourceAlias, ALIAS_TEXT_MAX_LENGTH);
+	}
+
+	/**
+	 * 解码 pairing GUI 别名保存提交包。
+	 */
+	static PairingNetwork.SubmitPairingAliasPayload decodeSubmitPairingAliasPayload(FriendlyByteBuf buffer) {
+		return new PairingNetwork.SubmitPairingAliasPayload(
+			buffer.readUtf(NODE_TYPE_MAX_LENGTH),
+			buffer.readVarLong(),
+			buffer.readUtf(ALIAS_TEXT_MAX_LENGTH)
+		);
+	}
+
+	/**
+	 * 编码同步遥控器强度保存提交包。
+	 */
+	static void encodeSaveSyncLinkerSignalStrengthPayload(FriendlyByteBuf buffer, long expectedSerial, int signalStrength) {
+		buffer.writeVarLong(Math.max(0L, expectedSerial));
+		buffer.writeVarInt(SignalStrengths.clamp(signalStrength));
+	}
+
+	/**
+	 * 解码同步遥控器强度保存提交包。
+	 */
+	static PairingNetwork.SaveSyncLinkerSignalStrengthPayload decodeSaveSyncLinkerSignalStrengthPayload(FriendlyByteBuf buffer) {
+		return new PairingNetwork.SaveSyncLinkerSignalStrengthPayload(buffer.readVarLong(), buffer.readVarInt());
+	}
+
+	/**
+	 * 编码配对反馈回执。
+	 */
+	static void encodeFeedbackPayload(FriendlyByteBuf buffer, boolean success, String messageKey, List<String> messageArgs) {
+		buffer.writeBoolean(success);
+		buffer.writeUtf(messageKey == null ? "" : messageKey, FEEDBACK_MESSAGE_KEY_MAX_LENGTH);
+		List<String> args = messageArgs == null ? List.of() : List.copyOf(messageArgs);
+		buffer.writeVarInt(args.size());
+		for (String arg : args) {
+			buffer.writeUtf(arg == null ? "" : arg, FEEDBACK_MESSAGE_ARG_MAX_LENGTH);
+		}
+	}
+
+	/**
+	 * 解码配对反馈回执。
+	 */
+	static PairingNetwork.PairingFeedbackPayload decodePairingFeedbackPayload(FriendlyByteBuf buffer) {
+		DecodedFeedbackPayload payload = decodeFeedbackPayload(buffer);
+		return new PairingNetwork.PairingFeedbackPayload(payload.success(), payload.messageKey(), payload.messageArgs());
+	}
+
+	/**
+	 * 编码 pairing GUI alias 状态回包。
+	 */
+	static void encodePairingAliasStatePayload(
+		FriendlyByteBuf buffer,
+		String sourceType,
+		long sourceSerial,
+		String sourceAlias,
+		String sourceDisplayText
+	) {
+		buffer.writeUtf(sourceType == null ? "" : sourceType, NODE_TYPE_MAX_LENGTH);
+		buffer.writeVarLong(Math.max(0L, sourceSerial));
+		buffer.writeUtf(sourceAlias == null ? "" : sourceAlias, ALIAS_TEXT_MAX_LENGTH);
+		buffer.writeUtf(sourceDisplayText == null ? "" : sourceDisplayText, DISPLAY_TEXT_MAX_LENGTH);
+	}
+
+	/**
+	 * 解码 pairing GUI alias 状态回包。
+	 */
+	static PairingNetwork.PairingAliasStatePayload decodePairingAliasStatePayload(FriendlyByteBuf buffer) {
+		return new PairingNetwork.PairingAliasStatePayload(
+			buffer.readUtf(NODE_TYPE_MAX_LENGTH),
+			buffer.readVarLong(),
+			buffer.readUtf(ALIAS_TEXT_MAX_LENGTH),
+			buffer.readUtf(DISPLAY_TEXT_MAX_LENGTH)
+		);
+	}
+
+	/**
+	 * 编码只携带节点定位上下文的查询请求。
+	 */
+	static void encodeSnapshotRequestPayload(
+		FriendlyByteBuf buffer,
+		String dimensionKey,
+		long blockPos,
+		String sourceType,
+		long sourceSerial
+	) {
+		buffer.writeUtf(dimensionKey, DIMENSION_KEY_MAX_LENGTH);
+		buffer.writeLong(blockPos);
+		buffer.writeUtf(sourceType, NODE_TYPE_MAX_LENGTH);
+		buffer.writeVarLong(sourceSerial);
+	}
+
+	/**
+	 * 解码“当前连接”查询请求。
+	 */
+	static PairingNetwork.RequestCurrentLinksPayload decodeRequestCurrentLinksPayload(FriendlyByteBuf buffer) {
+		DecodedSnapshotRequestPayload payload = decodeSnapshotRequestPayload(buffer);
+		return new PairingNetwork.RequestCurrentLinksPayload(
+			payload.dimensionKey(),
+			payload.blockPos(),
+			payload.sourceType(),
+			payload.sourceSerial()
+		);
+	}
+
+	/**
+	 * 解码“最终 IO”查询请求。
+	 */
+	static PairingNetwork.RequestRuntimeHudSnapshotPayload decodeRequestRuntimeHudSnapshotPayload(FriendlyByteBuf buffer) {
+		DecodedSnapshotRequestPayload payload = decodeSnapshotRequestPayload(buffer);
+		return new PairingNetwork.RequestRuntimeHudSnapshotPayload(
+			payload.dimensionKey(),
+			payload.blockPos(),
+			payload.sourceType(),
+			payload.sourceSerial()
+		);
+	}
+
+	/**
+	 * 编码“当前连接”回包。
+	 */
+	static void encodeCurrentLinksSnapshotPayload(
+		FriendlyByteBuf buffer,
+		String dimensionKey,
+		long blockPos,
+		String sourceType,
+		long sourceSerial,
+		List<Long> targets,
+		List<String> targetDisplayTexts,
+		String connectionModeToken,
+		long channel,
+		CrossChunkNodeIdentity crossChunkIdentity
+	) {
+		buffer.writeUtf(dimensionKey, DIMENSION_KEY_MAX_LENGTH);
+		buffer.writeLong(blockPos);
+		buffer.writeUtf(sourceType, NODE_TYPE_MAX_LENGTH);
+		buffer.writeVarLong(sourceSerial);
+		buffer.writeVarInt(targets.size());
+		for (long target : targets) {
+			buffer.writeVarLong(target);
+		}
+		writeDisplayTexts(buffer, targetDisplayTexts);
+		buffer.writeUtf(LinkConnectionMode.fromToken(connectionModeToken).token(), MODE_TOKEN_MAX_LENGTH);
+		buffer.writeVarLong(Math.max(0L, channel));
+		buffer.writeUtf(normalizeCrossChunkIdentity(crossChunkIdentity).payloadToken(), CROSS_CHUNK_IDENTITY_TOKEN_MAX_LENGTH);
+	}
+
+	/**
+	 * 解码“当前连接”回包。
+	 */
+	static PairingNetwork.CurrentLinksSnapshotPayload decodeCurrentLinksSnapshotPayload(FriendlyByteBuf buffer) {
+		DecodedCurrentLinksPayload payload = decodeCurrentLinksPayload(buffer);
+		return new PairingNetwork.CurrentLinksSnapshotPayload(
+			payload.dimensionKey(),
+			payload.blockPos(),
+			payload.sourceType(),
+			payload.sourceSerial(),
+			payload.targets(),
+			payload.targetDisplayTexts(),
+			payload.connectionModeToken(),
+			payload.channel(),
+			payload.crossChunkIdentity()
+		);
+	}
+
+	/**
+	 * 编码“最终 IO”回包。
+	 */
+	static void encodeRuntimeHudSnapshotPayload(
+		FriendlyByteBuf buffer,
+		String dimensionKey,
+		long blockPos,
+		String sourceType,
+		long sourceSerial,
+		boolean available,
+		int inputPower,
+		int outputPower
+	) {
+		encodeSnapshotRequestPayload(buffer, dimensionKey, blockPos, sourceType, sourceSerial);
+		buffer.writeBoolean(available);
+		buffer.writeVarInt(inputPower);
+		buffer.writeVarInt(outputPower);
+	}
+
+	/**
+	 * 解码“最终 IO”回包。
+	 */
+	static PairingNetwork.RuntimeHudSnapshotPayload decodeRuntimeHudSnapshotPayload(FriendlyByteBuf buffer) {
+		DecodedSnapshotRequestPayload requestPayload = decodeSnapshotRequestPayload(buffer);
+		boolean available = buffer.readBoolean();
+		int inputPower = buffer.readVarInt();
+		int outputPower = buffer.readVarInt();
+		return new PairingNetwork.RuntimeHudSnapshotPayload(
+			requestPayload.dimensionKey(),
+			requestPayload.blockPos(),
+			requestPayload.sourceType(),
+			requestPayload.sourceSerial(),
+			available,
+			inputPower,
+			outputPower
+		);
+	}
+
+	/**
+	 * 归一化 HUD 红石强度。
+	 *
+	 * @param power 待归一化强度
+	 * @return 限制在 `0..15` 的强度值
+	 */
+	static int clampHudPower(int power) {
+		return Math.max(0, Math.min(15, power));
+	}
+
+	/**
+	 * 解码通用配对 payload。
+	 */
+	private static DecodedPayload decodePairingPayload(FriendlyByteBuf buffer) {
+		long sourceSerial = buffer.readVarLong();
+		int size = buffer.readVarInt();
+		List<Long> targets = new ArrayList<>(size);
+		for (int i = 0; i < size; i++) {
+			targets.add(buffer.readVarLong());
+		}
+		List<String> targetDisplayTexts = readDisplayTexts(buffer);
+		return new DecodedPayload(
+			sourceSerial,
+			targets,
+			targetDisplayTexts,
+			buffer.readVarLong(),
+			buffer.readVarLong(),
+			buffer.readVarLong(),
+			buffer.readUtf(MODE_TOKEN_MAX_LENGTH),
+			buffer.readVarLong(),
+			buffer.readUtf(DISPLAY_CONTEXT_TOKEN_MAX_LENGTH),
+			buffer.readUtf(ALIAS_TEXT_MAX_LENGTH),
+			buffer.readUtf(DISPLAY_TEXT_MAX_LENGTH)
+		);
+	}
+
+	/**
+	 * 解码只携带节点定位上下文的请求。
+	 */
+	private static DecodedSnapshotRequestPayload decodeSnapshotRequestPayload(FriendlyByteBuf buffer) {
+		String dimensionKey = buffer.readUtf(DIMENSION_KEY_MAX_LENGTH);
+		long blockPos = buffer.readLong();
+		String sourceType = buffer.readUtf(NODE_TYPE_MAX_LENGTH);
+		long sourceSerial = buffer.readVarLong();
+		return new DecodedSnapshotRequestPayload(dimensionKey, blockPos, sourceType, sourceSerial);
+	}
+
+	/**
+	 * 解码“当前连接”回包。
+	 */
+	private static DecodedCurrentLinksPayload decodeCurrentLinksPayload(FriendlyByteBuf buffer) {
+		DecodedSnapshotRequestPayload payload = decodeSnapshotRequestPayload(buffer);
+		int size = buffer.readVarInt();
+		List<Long> targets = new ArrayList<>(size);
+		for (int i = 0; i < size; i++) {
+			targets.add(buffer.readVarLong());
+		}
+		List<String> targetDisplayTexts = readDisplayTexts(buffer);
+		String connectionModeToken = buffer.readUtf(MODE_TOKEN_MAX_LENGTH);
+		long channel = buffer.readVarLong();
+		CrossChunkNodeIdentity crossChunkIdentity = CrossChunkNodeIdentity.fromPayloadToken(
+			buffer.readUtf(CROSS_CHUNK_IDENTITY_TOKEN_MAX_LENGTH)
+		);
+		return new DecodedCurrentLinksPayload(
+			payload.dimensionKey(),
+			payload.blockPos(),
+			payload.sourceType(),
+			payload.sourceSerial(),
+			targets,
+			targetDisplayTexts,
+			connectionModeToken,
+			channel,
+			crossChunkIdentity
+		);
+	}
+
+	/**
+	 * 归一化跨区块身份字段，避免空值下发到客户端。
+	 */
+	private static CrossChunkNodeIdentity normalizeCrossChunkIdentity(CrossChunkNodeIdentity crossChunkIdentity) {
+		return crossChunkIdentity == null ? CrossChunkNodeIdentity.NORMAL : crossChunkIdentity;
+	}
+
+	private static void writeDisplayTexts(FriendlyByteBuf buffer, List<String> targetDisplayTexts) {
+		List<String> normalizedDisplayTexts = targetDisplayTexts == null ? List.of() : List.copyOf(targetDisplayTexts);
+		buffer.writeVarInt(normalizedDisplayTexts.size());
+		for (String displayText : normalizedDisplayTexts) {
+			buffer.writeUtf(displayText == null ? "" : displayText, DISPLAY_TEXT_MAX_LENGTH);
+		}
+	}
+
+	private static List<String> readDisplayTexts(FriendlyByteBuf buffer) {
+		int size = buffer.readVarInt();
+		List<String> displayTexts = new ArrayList<>(size);
+		for (int index = 0; index < size; index++) {
+			displayTexts.add(buffer.readUtf(DISPLAY_TEXT_MAX_LENGTH));
+		}
+		return List.copyOf(displayTexts);
+	}
+
+	/**
+	 * 编码“单序号 + 表达式”结构化提交包。
+	 */
+	private static void encodeSubmitPairingExpressionPayload(
+		FriendlyByteBuf buffer,
+		long serial,
+		String connectionModeToken,
+		String expression,
+		long channel,
+		long expectedRevision
+	) {
+		buffer.writeVarLong(Math.max(0L, serial));
+		buffer.writeUtf(LinkConnectionMode.fromToken(connectionModeToken).token(), MODE_TOKEN_MAX_LENGTH);
+		buffer.writeUtf(expression == null ? "" : expression, RedstoneLinkConfig.command().linkSetMaxInputLength());
+		buffer.writeVarLong(Math.max(0L, channel));
+		buffer.writeVarLong(Math.max(0L, expectedRevision));
+	}
+
+	/**
+	 * 解码“单序号 + 表达式”结构化提交包。
+	 */
+	private static DecodedSubmitPairingPayload decodeSubmitPairingExpressionPayload(FriendlyByteBuf buffer) {
+		return new DecodedSubmitPairingPayload(
+			buffer.readVarLong(),
+			buffer.readUtf(MODE_TOKEN_MAX_LENGTH),
+			buffer.readUtf(RedstoneLinkConfig.command().linkSetMaxInputLength()),
+			buffer.readVarLong(),
+			buffer.readVarLong()
+		);
+	}
+
+	/**
+	 * 解码配对反馈回执。
+	 */
+	private static DecodedFeedbackPayload decodeFeedbackPayload(FriendlyByteBuf buffer) {
+		boolean success = buffer.readBoolean();
+		String messageKey = buffer.readUtf(FEEDBACK_MESSAGE_KEY_MAX_LENGTH);
+		int size = buffer.readVarInt();
+		List<String> messageArgs = new ArrayList<>(Math.max(size, 0));
+		for (int index = 0; index < size; index++) {
+			messageArgs.add(buffer.readUtf(FEEDBACK_MESSAGE_ARG_MAX_LENGTH));
+		}
+		return new DecodedFeedbackPayload(success, messageKey, List.copyOf(messageArgs));
+	}
+
+	/**
+	 * 通用配对 payload 解码结果。
+	 */
+	private record DecodedPayload(
+		long sourceSerial,
+		List<Long> targets,
+		List<String> targetDisplayTexts,
+		long graphRevision,
+		long sourceRevision,
+		long coreRevision,
+		String connectionModeToken,
+		long channel,
+		String displayContextToken,
+		String sourceAlias,
+		String sourceDisplayText
+	) {}
+
+	/**
+	 * “单序号 + 表达式”提交包解码结果。
+	 */
+	private record DecodedSubmitPairingPayload(
+		long serial,
+		String connectionModeToken,
+		String expression,
+		long channel,
+		long expectedRevision
+	) {}
+
+	/**
+	 * 只携带节点定位上下文的请求解码结果。
+	 */
+	private record DecodedSnapshotRequestPayload(
+		String dimensionKey,
+		long blockPos,
+		String sourceType,
+		long sourceSerial
+	) {}
+
+	/**
+	 * “当前连接”回包解码结果。
+	 */
+	private record DecodedCurrentLinksPayload(
+		String dimensionKey,
+		long blockPos,
+		String sourceType,
+		long sourceSerial,
+		List<Long> targets,
+		List<String> targetDisplayTexts,
+		String connectionModeToken,
+		long channel,
+		CrossChunkNodeIdentity crossChunkIdentity
+	) {}
+
+	/**
+	 * 配对反馈回执解码结果。
+	 */
+	private record DecodedFeedbackPayload(boolean success, String messageKey, List<String> messageArgs) {}
+}

@@ -1,0 +1,210 @@
+package com.makomi.block;
+
+import com.makomi.block.entity.LinkTriggerSourceBlockEntity;
+import com.makomi.block.entity.LinkSyncLeverBlockEntity;
+import com.makomi.block.entity.PlacedPairableNodeGuiOpenSupport;
+import com.makomi.config.RedstoneLinkConfig;
+import com.makomi.data.LinkItemData;
+import com.makomi.data.LinkGuiDisplayContext;
+import com.makomi.data.LinkNodeType;
+import com.makomi.network.PairingNetwork;
+import java.util.ArrayList;
+import java.util.List;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.particles.DustParticleOptions;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.util.RandomSource;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.BlockGetter;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.EntityBlock;
+import net.minecraft.world.level.block.LeverBlock;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.state.BlockBehaviour;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.storage.loot.LootParams;
+import net.minecraft.world.level.storage.loot.parameters.LootContextParams;
+import net.minecraft.world.phys.BlockHitResult;
+import org.joml.Vector3f;
+
+/**
+ * 连接同步拉杆方块。
+ * <p>
+ * 保留拨杆交互手感，但屏蔽原版红石输出，
+ * 仅作为 triggerSource 节点将目标状态同步对齐到当前拨杆状态（sync 语义）。
+ * </p>
+ */
+public class LinkSyncLeverBlock extends LeverBlock implements EntityBlock {
+	private static final Vector3f ORANGE_PARTICLE_BASE_COLOR = new Vector3f(1.0F, 0.58F, 0.16F);
+
+	// 拉杆属于触发器类，实现上复用 triggerSource 公共实体层。
+	public LinkSyncLeverBlock(BlockBehaviour.Properties properties) {
+		super(properties);
+	}
+
+	@Override
+	public BlockEntity newBlockEntity(BlockPos blockPos, BlockState blockState) {
+		return new LinkSyncLeverBlockEntity(blockPos, blockState);
+	}
+
+	@Override
+	public void setPlacedBy(Level level, BlockPos pos, BlockState state, LivingEntity placer, ItemStack stack) {
+		super.setPlacedBy(level, pos, state, placer, stack);
+		if (!(level instanceof ServerLevel serverLevel)) {
+			return;
+		}
+		if (!(level.getBlockEntity(pos) instanceof LinkTriggerSourceBlockEntity triggerSourceBlockEntity)) {
+			return;
+		}
+
+		long serial = LinkItemData.resolvePlacementSerial(stack, serverLevel, LinkNodeType.TRIGGER_SOURCE, pos);
+		triggerSourceBlockEntity.setLinkData(serial);
+	}
+
+	@Override
+	protected List<ItemStack> getDrops(BlockState state, LootParams.Builder builder) {
+		List<ItemStack> drops = new ArrayList<>(super.getDrops(state, builder));
+		if (drops.isEmpty()) {
+			drops.add(new ItemStack(asItem()));
+		}
+
+		if (!(builder.getOptionalParameter(LootContextParams.BLOCK_ENTITY) instanceof LinkTriggerSourceBlockEntity triggerSourceBlockEntity)) {
+			return drops;
+		}
+
+		long serial = triggerSourceBlockEntity.getSerial();
+		if (serial <= 0L) {
+			return drops;
+		}
+
+		for (ItemStack drop : drops) {
+			if (drop.is(asItem())) {
+				LinkItemData.setSerial(drop, serial);
+				LinkItemData.setDestroyRetireCandidate(drop, true);
+				if (triggerSourceBlockEntity.getLevel() instanceof ServerLevel serverLevel) {
+					LinkItemData.syncCurrentLinksSnapshotIfSingle(drop, serverLevel);
+				}
+			}
+		}
+		return drops;
+	}
+
+	@Override
+	protected void onRemove(BlockState state, Level level, BlockPos pos, BlockState newState, boolean movedByPiston) {
+		if (!state.is(newState.getBlock())) {
+			if (level.getBlockEntity(pos) instanceof LinkTriggerSourceBlockEntity triggerSourceBlockEntity) {
+				triggerSourceBlockEntity.markPhysicalRemovalInProgress();
+				triggerSourceBlockEntity.unregisterNode(true);
+			}
+		}
+		super.onRemove(state, level, pos, newState, movedByPiston);
+	}
+
+	@Override
+	protected InteractionResult useWithoutItem(
+		BlockState state,
+		Level level,
+		BlockPos pos,
+		Player player,
+		BlockHitResult hitResult
+	) {
+		if (RedstoneLinkConfig.canOpenPairingByPlacedBlock(player)) {
+			openPairingScreen(level, pos, player);
+			return InteractionResult.sidedSuccess(level.isClientSide);
+		}
+
+		if (level.isClientSide) {
+			// 客户端点击预览阶段不走父类红色粒子逻辑，改为“仅在切换为激活时”发橙色粒子。
+			if (!state.getValue(POWERED)) {
+				spawnOrangeParticle(level, pos, level.random, 0.98F, 0.36F);
+			}
+			return InteractionResult.SUCCESS;
+		}
+
+		InteractionResult result = super.useWithoutItem(state, level, pos, player, hitResult);
+		if (result.consumesAction()) {
+			if (level.getBlockEntity(pos) instanceof LinkSyncLeverBlockEntity syncLeverBlockEntity) {
+				// 拉杆改为同步语义：目标状态始终与拉杆当前状态对齐。
+				boolean signalOn = level.getBlockState(pos).getValue(POWERED);
+				int signalStrength = signalOn ? 15 : 0;
+				syncLeverBlockEntity.forwardLinkedSignal(player, signalStrength);
+			}
+		}
+		return result;
+	}
+
+	@Override
+	protected boolean isSignalSource(BlockState state) {
+		return false;
+	}
+
+	@Override
+	protected int getSignal(BlockState state, BlockGetter level, BlockPos pos, Direction direction) {
+		return 0;
+	}
+
+	@Override
+	protected int getDirectSignal(BlockState state, BlockGetter level, BlockPos pos, Direction direction) {
+		return 0;
+	}
+
+	/**
+	 * 激活态橙色粒子：仅调整视觉反馈，不改变拉杆“状态对齐”语义。
+	 */
+	@Override
+	public void animateTick(BlockState state, Level level, BlockPos pos, RandomSource random) {
+		if (!state.getValue(POWERED) || random.nextFloat() > 0.30F) {
+			return;
+		}
+
+		spawnOrangeParticle(level, pos, random, 0.82F, 0.30F);
+	}
+
+	/**
+	 * 统一橙色粒子生成逻辑。
+	 *
+	 * @param baseIntensity 基础亮度
+	 * @param baseScale 粒子基础尺寸
+	 */
+	private static void spawnOrangeParticle(Level level, BlockPos pos, RandomSource random, float baseIntensity, float baseScale) {
+		float intensity = baseIntensity + random.nextFloat() * Math.max(0.0F, 1.0F - baseIntensity);
+		float red = ORANGE_PARTICLE_BASE_COLOR.x() * intensity;
+		float green = ORANGE_PARTICLE_BASE_COLOR.y() * intensity;
+		float blue = ORANGE_PARTICLE_BASE_COLOR.z() * intensity;
+		float scale = baseScale + random.nextFloat() * 0.12F;
+
+		double x = pos.getX() + 0.5D + (random.nextDouble() - 0.5D) * 0.45D;
+		double y = pos.getY() + 0.5D + (random.nextDouble() - 0.5D) * 0.30D;
+		double z = pos.getZ() + 0.5D + (random.nextDouble() - 0.5D) * 0.45D;
+		level.addParticle(new DustParticleOptions(new Vector3f(red, green, blue), scale), x, y, z, 0.0D, 0.0D, 0.0D);
+	}
+
+	/**
+	 * 打开 triggerSource 配对界面，并在 reopen 时自愈已退役/失效 serial。
+	 */
+	private static void openPairingScreen(Level level, BlockPos pos, Player player) {
+		if (!(level instanceof ServerLevel serverLevel) || !(player instanceof ServerPlayer serverPlayer)) {
+			return;
+		}
+		if (level.getBlockEntity(pos) instanceof LinkTriggerSourceBlockEntity triggerSourceBlockEntity) {
+			long serial = PlacedPairableNodeGuiOpenSupport.ensureSerialReadyForPairingOpen(
+				serverLevel,
+				pos,
+				triggerSourceBlockEntity
+			);
+			if (serial > 0L) {
+				PairingNetwork.openTriggerSourcePairing(
+					serverPlayer,
+					serial,
+					LinkGuiDisplayContext.resolvePairingContextToken(level.getBlockState(pos).getBlock(), LinkNodeType.TRIGGER_SOURCE)
+				);
+			}
+		}
+	}
+
+}

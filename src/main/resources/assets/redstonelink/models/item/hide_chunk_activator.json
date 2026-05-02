@@ -1,0 +1,6 @@
+{
+  "parent": "minecraft:block/cube_all",
+  "textures": {
+    "all": "redstonelink:item/chunk_activator_hide"
+  }
+}

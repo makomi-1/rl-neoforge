@@ -1,0 +1,7 @@
+{
+  "render_type": "minecraft:cutout",
+  "parent": "minecraft:block/button_pressed",
+  "textures": {
+    "texture": "redstonelink:block/link_push_button_overlay"
+  }
+}

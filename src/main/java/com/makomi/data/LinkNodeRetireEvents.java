@@ -1,0 +1,527 @@
+package com.makomi.data;
+
+import com.makomi.RedstoneLink;
+import com.makomi.block.entity.PairableNodeBlockEntity;
+import com.makomi.config.RedstoneLinkConfig;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.event.player.PlayerBlockBreakEvents;
+import net.minecraft.core.BlockPos;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.Level;
+
+/**
+ * 节点退役事件注册器。
+ * <p>
+ * 负责将“物品销毁退役”“创造破坏退役”“待确认退役补偿”三条路径统一收口到
+ * {@link LinkSavedData#retireNode(LinkNodeType, long)}。
+ * </p>
+ */
+public final class LinkNodeRetireEvents {
+	/**
+	 * 节点下线后进入待确认队列的宽限时长（tick）。
+	 */
+	private static final int PENDING_RETIRE_GRACE_TICKS = 40;
+
+	/**
+	 * 在节点移除点附近扫描掉落物的半径。
+	 */
+	private static final double DROP_MATCH_SCAN_RADIUS = 2.5D;
+
+	/**
+	 * 无到期任务时使用的占位 tick。
+	 */
+	private static final long NO_DUE_TICK = Long.MAX_VALUE;
+
+	/**
+	 * 物品自然消失的默认年龄阈值（tick）。
+	 */
+	private static final int ITEM_NATURAL_DESPAWN_AGE = 6000;
+
+	/**
+	 * 按服务器实例隔离的待退役状态。
+	 */
+	private static final Map<MinecraftServer, PendingRetireState> PENDING_RETIRES = new IdentityHashMap<>();
+
+	private LinkNodeRetireEvents() {
+	}
+
+	/**
+	 * 注册节点退役相关事件。
+	 * <p>
+	 * 当前实现挂接以下事件：
+	 * </p>
+	 * <ul>
+	 * <li>{@code ENTITY_UNLOAD}：物品实体以 KILLED/DISCARDED 卸载时立即退役；</li>
+	 * <li>{@code ENTITY_LOAD}：发现匹配物品掉落实体时取消待退役；</li>
+	 * <li>{@code PlayerBlockBreakEvents.AFTER}：创造模式破坏已放置节点时立即退役；</li>
+	 * <li>{@code END_SERVER_TICK}：处理到期待退役任务；</li>
+	 * <li>{@code SERVER_STARTED}：从持久化镜像恢复待退役任务；</li>
+	 * <li>{@code SERVER_STOPPING}：停服前兜底处理已到期任务；</li>
+	 * <li>{@code SERVER_STOPPED}：清理该服务器的待退役状态。</li>
+	 * </ul>
+	 */
+	public static void register() {
+		ServerEntityEvents.ENTITY_UNLOAD.register((entity, level) -> {
+			if (!(entity instanceof ItemEntity itemEntity)) {
+				return;
+			}
+			long startNs = System.nanoTime();
+			String outcome = "UNKNOWN";
+			Entity.RemovalReason reason = entity.getRemovalReason();
+			try {
+				MinecraftServer server = level.getServer();
+				UUID entityId = itemEntity.getUUID();
+				if (reason != Entity.RemovalReason.KILLED && reason != Entity.RemovalReason.DISCARDED) {
+					clearEntityKey(server, entityId);
+					clearDamageDiscardMark(server, entityId);
+					outcome = "SKIP_NON_DESTRUCTIVE";
+					return;
+				}
+
+				PendingKey key = resolveUnloadKey(server, itemEntity);
+				boolean discardedByDamage = consumeDamageDiscardMark(server, entityId);
+				clearEntityKey(server, entityId);
+				if (reason == Entity.RemovalReason.DISCARDED
+					&& !discardedByDamage
+					&& itemEntity.getAge() < ITEM_NATURAL_DESPAWN_AGE) {
+					// 低年龄 DISCARDED 且非伤害销毁，按“被拾取/主动丢弃”处理，不做退役。
+					outcome = "SKIP_LOW_AGE_DISCARDED";
+					return;
+				}
+				if (key == null) {
+					int retiredContainedNodes = SmartNodeContainerRetireSupport.retireContainedNodes(level, itemEntity.getItem());
+					if (retiredContainedNodes > 0) {
+						outcome = "RETIRED_CONTAINER";
+						return;
+					}
+					outcome = SmartNodeContainerRetireSupport.isSmartNodeContainerStack(itemEntity.getItem())
+						? "SKIP_CONTAINER_EMPTY_OR_ONLINE"
+						: "SKIP_NO_KEY";
+					return;
+				}
+				LinkSavedData savedData = LinkSavedData.get(level);
+				// 若该序号仍存在已放置节点，则不应被“物品实体销毁”路径退役。
+				if (savedData.findNode(key.nodeType(), key.serial()).isPresent()) {
+					outcome = "SKIP_NODE_STILL_ONLINE";
+					return;
+				}
+				LinkRetireCoordinator.retireAndSyncWhitelist(level, key.nodeType(), key.serial());
+				outcome = "RETIRED";
+			} finally {
+				logEntityUnloadIfSlow(level, itemEntity, reason, outcome, startNs);
+			}
+		});
+
+		ServerEntityEvents.ENTITY_LOAD.register((entity, level) -> {
+			if (!(entity instanceof ItemEntity itemEntity)) {
+				return;
+			}
+
+			PendingKey key = pendingKeyFromStack(itemEntity.getItem(), true);
+			if (key == null) {
+				clearEntityKey(level.getServer(), itemEntity.getUUID());
+				return;
+			}
+			rememberEntityKey(level.getServer(), itemEntity.getUUID(), key);
+			cancelPending(level.getServer(), key);
+		});
+
+		// 创造模式下破坏已放置节点时，直接退役并取消可能存在的待退役记录。
+		PlayerBlockBreakEvents.AFTER.register((world, player, pos, state, blockEntity) -> {
+			if (!(world instanceof ServerLevel serverLevel)) {
+				return;
+			}
+			if (!player.getAbilities().instabuild) {
+				return;
+			}
+			if (!(blockEntity instanceof PairableNodeBlockEntity pairableNodeBlockEntity)) {
+				return;
+			}
+
+			long serial = pairableNodeBlockEntity.getSerial();
+			if (serial <= 0L) {
+				return;
+			}
+			LinkNodeType nodeType = pairableNodeBlockEntity.getLinkNodeType();
+			PendingKey key = new PendingKey(nodeType, serial);
+			cancelPending(serverLevel.getServer(), key);
+			LinkRetireCoordinator.retireAndSyncWhitelist(serverLevel, nodeType, serial);
+		});
+
+		ServerTickEvents.END_SERVER_TICK.register(LinkNodeRetireEvents::processPendingRetires);
+		ServerLifecycleEvents.SERVER_STARTED.register(LinkNodeRetireEvents::restorePendingRetires);
+		ServerLifecycleEvents.SERVER_STOPPING.register(LinkNodeRetireEvents::drainDuePendingRetiresOnStopping);
+		ServerLifecycleEvents.SERVER_STOPPED.register(PENDING_RETIRES::remove);
+	}
+
+	/**
+	 * 显式取消指定节点的待退役任务。
+	 * <p>
+	 * 供“受控回收/受控保留”路径在确认节点物品已被安全接管后调用，
+	 * 避免宽限期结束后把仍有载体的节点误退役。
+	 * </p>
+	 */
+	public static void cancelPendingRetire(ServerLevel level, LinkNodeType nodeType, long serial) {
+		if (level == null || nodeType == null || serial <= 0L) {
+			return;
+		}
+		cancelPending(level.getServer(), new PendingKey(nodeType, serial));
+	}
+
+	/**
+	 * 标记“该物品实体即将因伤害导致 DISCARDED”，用于与“被拾取触发 DISCARDED”区分。
+	 *
+	 * @param itemEntity 物品实体
+	 */
+	public static void markDamageDiscard(ItemEntity itemEntity) {
+		if (!(itemEntity.level() instanceof ServerLevel serverLevel)) {
+			return;
+		}
+		MinecraftServer server = serverLevel.getServer();
+		UUID entityId = itemEntity.getUUID();
+		PendingKey key = pendingKeyFromStack(itemEntity.getItem(), true);
+		if (key != null) {
+			rememberEntityKey(server, entityId, key);
+		}
+		markDamageDiscard(server, entityId);
+	}
+
+	/**
+	 * 在节点下线时登记待确认退役。
+	 * <p>
+	 * 若宽限期内检测到同序号掉落物/玩家背包内物品，则取消退役；否则到期后执行退役。
+	 * </p>
+	 *
+	 * @param level 服务端维度
+	 * @param nodeType 节点类型
+	 * @param serial 节点序号
+	 * @param pos 节点移除位置
+	 */
+	public static void enqueuePendingRetire(ServerLevel level, LinkNodeType nodeType, long serial, BlockPos pos) {
+		if (serial <= 0L) {
+			return;
+		}
+
+		// 仅对“已分配且未退役”的有效序号入桶，避免无效数据膨胀待处理队列。
+		LinkSavedData savedData = LinkSavedData.get(level);
+		if (!savedData.isSerialActive(nodeType, serial)) {
+			return;
+		}
+
+		PendingKey key = new PendingKey(nodeType, serial);
+		MinecraftServer server = level.getServer();
+
+		// 同一节点已在待退役队列中时不重复入桶。
+		if (isPending(server, key)) {
+			return;
+		}
+
+		// 如果移除点附近已经出现匹配掉落物，说明走的是正常掉落链路，不需要挂起。
+		if (hasMatchingDropEntity(level, key, pos)) {
+			return;
+		}
+
+		long expireTick = level.getGameTime() + PENDING_RETIRE_GRACE_TICKS;
+		PendingEntry entry = new PendingEntry(key, level.dimension(), pos.immutable(), expireTick);
+		upsertPending(server, entry);
+		upsertPendingMirror(level, entry);
+	}
+
+	/**
+	 * 判断指定节点是否已在待退役队列中。
+	 */
+	private static boolean isPending(MinecraftServer server, PendingKey key) {
+		return LinkNodeRetireStateSupport.isPending(PENDING_RETIRES, server, key);
+	}
+
+	/**
+	 * 处理当前 tick 到期的待退役任务。
+	 */
+	private static void processPendingRetires(MinecraftServer server) {
+		long startNs = System.nanoTime();
+		PendingRetireState state = PENDING_RETIRES.get(server);
+		if (state == null || state.pendingByKey.isEmpty()) {
+			return;
+		}
+
+		ServerLevel overworld = server.overworld();
+		if (overworld == null) {
+			return;
+		}
+		long now = overworld.getGameTime();
+		if (now < state.nextDueTick) {
+			return;
+		}
+		LinkSavedData savedData = LinkSavedData.get(overworld);
+		PendingRetireQueueSavedData pendingMirror = PendingRetireQueueSavedData.get(overworld);
+		int dueEntries = 0;
+		int skippedRetires = 0;
+		int retiredCount = 0;
+
+		while (state.nextDueTick != NO_DUE_TICK && state.nextDueTick <= now) {
+			long dueTick = state.nextDueTick;
+			List<PendingKey> dueKeys = state.bucketByExpireTick.remove(dueTick);
+			if (dueKeys != null) {
+				for (PendingKey key : dueKeys) {
+					PendingEntry entry = state.pendingByKey.get(key);
+					if (entry == null || entry.expireTick() != dueTick) {
+						continue;
+					}
+					dueEntries++;
+					state.pendingByKey.remove(key);
+					removePendingMirror(pendingMirror, key);
+					if (shouldSkipPendingRetire(server, savedData, entry)) {
+						skippedRetires++;
+						continue;
+					}
+					LinkRetireCoordinator.retireAndSyncWhitelist(overworld, key.nodeType(), key.serial());
+					retiredCount++;
+				}
+			}
+			recalculateNextDueTick(state);
+		}
+		logPendingRetireTickIfSlow(server, now, dueEntries, skippedRetires, retiredCount, state.pendingByKey.size(), startNs);
+	}
+
+	/**
+	 * 记录 ENTITY_UNLOAD 退役慢路径耗时。
+	 */
+	private static void logEntityUnloadIfSlow(
+		ServerLevel level,
+		ItemEntity itemEntity,
+		Entity.RemovalReason reason,
+		String outcome,
+		long startNs
+	) {
+		if (!RedstoneLinkConfig.crossChunk().runtimeDiagEnabled()) {
+			return;
+		}
+		long elapsedMs = (System.nanoTime() - startNs) / 1_000_000L;
+		long thresholdMs = RedstoneLinkConfig.crossChunk().runtimeDiagWarnThresholdMs();
+		if (elapsedMs < thresholdMs) {
+			return;
+		}
+		RedstoneLink.LOGGER.warn(
+			"[DiagRuntime] retire_entity_unload_slow dimension={}, entityId={}, reason={}, outcome={}, age={}, elapsedMs={}, thresholdMs={}",
+			level.dimension().location(),
+			itemEntity.getUUID(),
+			reason,
+			outcome,
+			itemEntity.getAge(),
+			elapsedMs,
+			thresholdMs
+		);
+	}
+
+	/**
+	 * 记录待退役队列处理慢路径耗时。
+	 */
+	private static void logPendingRetireTickIfSlow(
+		MinecraftServer server,
+		long now,
+		int dueEntries,
+		int skippedRetires,
+		int retiredCount,
+		int remainingEntries,
+		long startNs
+	) {
+		if (!RedstoneLinkConfig.crossChunk().runtimeDiagEnabled()) {
+			return;
+		}
+		long elapsedMs = (System.nanoTime() - startNs) / 1_000_000L;
+		long thresholdMs = RedstoneLinkConfig.crossChunk().runtimeDiagWarnThresholdMs();
+		if (elapsedMs < thresholdMs) {
+			return;
+		}
+		RedstoneLink.LOGGER.warn(
+			"[DiagRuntime] pending_retire_tick_slow dimension={}, nowTick={}, elapsedMs={}, thresholdMs={}, dueEntries={}, skipped={}, retired={}, remaining={}",
+			server.overworld() == null ? "unknown" : server.overworld().dimension().location(),
+			now,
+			elapsedMs,
+			thresholdMs,
+			dueEntries,
+			skippedRetires,
+			retiredCount,
+			remainingEntries
+		);
+	}
+
+	/**
+	 * 判断当前待退役是否应跳过。
+	 * <p>
+	 * 跳过条件：序号已不存在、附近有匹配掉落物、或在线玩家背包中存在匹配物品。
+	 * </p>
+	 */
+	private static boolean shouldSkipPendingRetire(MinecraftServer server, LinkSavedData savedData, PendingEntry entry) {
+		return LinkNodeRetireMatchSupport.shouldSkipPendingRetire(
+			PENDING_RETIRES,
+			server,
+			savedData,
+			entry,
+			DROP_MATCH_SCAN_RADIUS
+		);
+	}
+
+
+	/**
+	 * 扫描指定位置附近是否存在匹配的掉落物实体。
+	 */
+	private static boolean hasMatchingDropEntity(ServerLevel level, PendingKey key, BlockPos aroundPos) {
+		return LinkNodeRetireMatchSupport.hasMatchingDropEntity(level, key, aroundPos, DROP_MATCH_SCAN_RADIUS);
+	}
+
+	/**
+	 * 从物品栈解析待退役键。
+	 */
+	private static PendingKey pendingKeyFromStack(ItemStack stack, boolean requireDestroyCandidate) {
+		return LinkNodeRetireMatchSupport.pendingKeyFromStack(stack, requireDestroyCandidate);
+	}
+
+	/**
+	 * 在实体卸载时解析待退役键：优先取当前实体栈，失败时回退到 UUID 缓存。
+	 */
+	private static PendingKey resolveUnloadKey(MinecraftServer server, ItemEntity itemEntity) {
+		return LinkNodeRetireMatchSupport.resolveUnloadKey(PENDING_RETIRES, server, itemEntity);
+	}
+
+	/**
+	 * 新增或更新待退役记录，并将其放入到期桶。
+	 */
+	private static void upsertPending(MinecraftServer server, PendingEntry newEntry) {
+		LinkNodeRetireStateSupport.upsertPending(PENDING_RETIRES, server, newEntry, NO_DUE_TICK);
+	}
+
+	/**
+	 * 取消指定待退役记录。
+	 */
+	private static void cancelPending(MinecraftServer server, PendingKey key) {
+		if (LinkNodeRetireStateSupport.cancelPending(PENDING_RETIRES, server, key, NO_DUE_TICK)) {
+			removePendingMirror(server, key);
+		}
+	}
+
+	/**
+	 * 重新计算下一次到期 tick。
+	 */
+	private static void recalculateNextDueTick(PendingRetireState state) {
+		LinkNodeRetireStateSupport.recalculateNextDueTick(state, NO_DUE_TICK);
+	}
+
+	/**
+	 * 将待退役任务同步到持久化镜像。
+	 */
+	private static void upsertPendingMirror(ServerLevel level, PendingEntry entry) {
+		LinkNodeRetireStateSupport.upsertPendingMirror(level, entry);
+	}
+
+	/**
+	 * 从持久化镜像中移除待退役任务。
+	 */
+	private static void removePendingMirror(MinecraftServer server, PendingKey key) {
+		LinkNodeRetireStateSupport.removePendingMirror(server, key);
+	}
+
+	/**
+	 * 从已获取的持久化镜像中移除待退役任务。
+	 */
+	private static void removePendingMirror(PendingRetireQueueSavedData pendingMirror, PendingKey key) {
+		LinkNodeRetireStateSupport.removePendingMirror(pendingMirror, key);
+	}
+
+	/**
+	 * 服务端启动后恢复待退役内存队列。
+	 */
+	private static void restorePendingRetires(MinecraftServer server) {
+		LinkNodeRetireStateSupport.restorePendingRetires(PENDING_RETIRES, server, NO_DUE_TICK);
+	}
+
+	/**
+	 * 停服前兜底处理一次“已到期”待退役任务。
+	 */
+	private static void drainDuePendingRetiresOnStopping(MinecraftServer server) {
+		processPendingRetires(server);
+	}
+
+	/**
+	 * 记录实体 UUID 与待退役键的对应关系，用于卸载阶段兜底解析。
+	 */
+	private static void rememberEntityKey(MinecraftServer server, UUID entityId, PendingKey key) {
+		LinkNodeRetireStateSupport.rememberEntityKey(PENDING_RETIRES, server, entityId, key, NO_DUE_TICK);
+	}
+
+	/**
+	 * 清理实体 UUID 对应的待退役键缓存。
+	 */
+	private static void clearEntityKey(MinecraftServer server, UUID entityId) {
+		LinkNodeRetireStateSupport.clearEntityKey(PENDING_RETIRES, server, entityId);
+	}
+
+	/**
+	 * 记录“该实体由伤害触发 DISCARDED”标记。
+	 */
+	private static void markDamageDiscard(MinecraftServer server, UUID entityId) {
+		LinkNodeRetireStateSupport.markDamageDiscard(PENDING_RETIRES, server, entityId, NO_DUE_TICK);
+	}
+
+	/**
+	 * 读取并移除“伤害触发 DISCARDED”标记。
+	 */
+	private static boolean consumeDamageDiscardMark(MinecraftServer server, UUID entityId) {
+		return LinkNodeRetireStateSupport.consumeDamageDiscardMark(PENDING_RETIRES, server, entityId);
+	}
+
+	/**
+	 * 清理“伤害触发 DISCARDED”标记。
+	 */
+	private static void clearDamageDiscardMark(MinecraftServer server, UUID entityId) {
+		LinkNodeRetireStateSupport.clearDamageDiscardMark(PENDING_RETIRES, server, entityId);
+	}
+
+	/**
+	 * 待退役键：节点类型 + 节点序号。
+	 */
+	record PendingKey(LinkNodeType nodeType, long serial) {}
+
+	/**
+	 * 待退役实体：保存定位与过期信息。
+	 */
+	record PendingEntry(
+		PendingKey key,
+		ResourceKey<Level> dimension,
+		BlockPos pos,
+		long expireTick
+	) {}
+
+	/**
+	 * 单服务器的待退役内存状态。
+	 */
+	static final class PendingRetireState {
+		final Map<PendingKey, PendingEntry> pendingByKey = new HashMap<>();
+		final Map<Long, List<PendingKey>> bucketByExpireTick = new HashMap<>();
+		final Map<UUID, PendingKey> rememberedEntityKeys = new HashMap<>();
+		final Set<UUID> damageDiscardedEntityIds = new HashSet<>();
+		long nextDueTick;
+
+		PendingRetireState() {
+			this(NO_DUE_TICK);
+		}
+
+		PendingRetireState(long noDueTick) {
+			this.nextDueTick = noDueTick;
+		}
+	}
+}

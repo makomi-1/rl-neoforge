@@ -9,8 +9,6 @@ description: 自动化更新 docs_dev 文档的工作流规范。基于用户聊
 基于用户聊天记录驱动 docs_dev 文档补充，按精简后的触发条件执行，并在必要时确认测试/审查与经验沉淀。
 
 ## 总体原则
-- 当前目标工作区：`D:\OpenProjects\RedstoneLink\rl-neoforge-1.21.1`
-- 当前目标分支：`migration/neoforge-1.21.1`（仓库初始化后生效；当前目录若未初始化 Git，则先跳过分支校验并报告）
 - 仅在“代码/配置/资源改动”时要求详细方案确认
 - 进入方案确认阶段时，回复末尾必须再用一句话简明扼要总结方案，便于用户快速复核。
 - 版本号审查与升版提醒仅在用户提出提交要求后触发；未提出提交要求时不做版本号检查。
@@ -30,7 +28,7 @@ description: 自动化更新 docs_dev 文档的工作流规范。基于用户聊
 - 目标文档缺失视为用户已手动迁移，只在汇报中说明，不创建新文件。
 - 涉及贴图资源（`src/main/resources/assets/**/textures/**`）改动时，必须先发起“修改请求确认”并获得用户明确“确认”；未确认前仅允许只读分析。
 - 若用户明确要求“只改渲染方式不改贴图”，必须将贴图文件列为禁止修改范围并严格执行。
-- 分支校验目标固定为 `migration/neoforge-1.21.1`；每轮首次涉及 Git 操作前先确认当前目录已初始化 Git，再执行 `git branch --show-current`，不一致立即停止并报告。
+- 分支校验目标固定为“当前分支”（以 `git branch --show-current` 实时结果为准）；每轮首次涉及 Git 操作前执行 `git branch --show-current`，不一致立即停止并报告。
 - 任何回退动作（包括 `git revert/reset/checkout --/restore`、覆盖旧文件、删除后恢复）前，必须中断并向用户请求明确确认；未确认不得执行。
 - 每次实现完成后，必须先执行一次全标签自动化测试回归：`.\gradlew.bat test testIntegration testClient testSlow testApiLegacy --no-daemon`。
 - 语义术语基线：新增设计文档与实施说明统一使用 `triggerSource/core`，禁止新增 `button/source/target` 作为主术语。
@@ -267,7 +265,7 @@ description: 自动化更新 docs_dev 文档的工作流规范。基于用户聊
 
 输出要求：
 - 五个章节必须全部存在，不得省略。
-- 每个章节都必须附关键代码引用，格式使用 Markdown 绝对路径并带具体行号，例如 `[LinkSavedData.java](/d:/OpenProjects/RedstoneLink/rl-fabric-1.21.11/src/main/java/com/makomi/data/LinkSavedData.java#L52)`。
+- 每个章节都必须附关键代码引用，格式使用 Markdown 绝对路径并带具体行号，例如 `[LinkSavedData.java](/d:/OpenProjects/RedstoneLink/rl-neoforge-1.21.1/src/main/java/com/makomi/data/LinkSavedData.java#L52)`。
 - 审查文档用于承载详细实现分析；任务汇报本身保持简短，不重复展开代码明细。
 
 模板示例：

@@ -1,0 +1,16 @@
+{
+  "replace": false,
+  "values": [
+    "redstonelink:link_redstone_core",
+    "redstonelink:link_redstone_core_transparent",
+    "redstonelink:link_toggle_button",
+    "redstonelink:link_sync_lever",
+    "redstonelink:link_toggle_emitter",
+    "redstonelink:link_pulse_emitter",
+    "redstonelink:link_sync_emitter",
+    "redstonelink:link_send_filter",
+    "redstonelink:link_receive_filter",
+    "redstonelink:link_chunk_activator",
+    "redstonelink:link_repeater"
+  ]
+}

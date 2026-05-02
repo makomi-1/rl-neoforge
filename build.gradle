@@ -30,8 +30,16 @@ base {
 
 java.toolchain.languageVersion = JavaLanguageVersion.of(21)
 
-sourceSets.main.resources {
-    srcDir('src/generated/resources')
+sourceSets {
+    main {
+        java {
+            srcDir('src/client/java')
+            exclude 'com/makomi/datagen/**'
+        }
+        resources {
+            srcDir('src/generated/resources')
+        }
+    }
 }
 
 neoForge {
