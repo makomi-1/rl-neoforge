@@ -5,7 +5,6 @@ import com.makomi.data.SmartNodeContainerPlacementType;
 import com.makomi.registry.ModItems;
 import com.makomi.registry.ModMenuTypes;
 import net.minecraft.core.NonNullList;
-import net.minecraft.world.Container;
 import net.minecraft.world.SimpleContainer;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.entity.player.Player;

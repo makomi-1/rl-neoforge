@@ -5,7 +5,6 @@ import com.makomi.block.LinkChunkActivatorBlock;
 import com.makomi.block.LinkCoreBlock;
 import com.makomi.block.LinkRepeaterBlock;
 import com.makomi.block.LinkSignalEmitterBlock;
-import com.makomi.block.LinkSyncEmitterBlock;
 import com.makomi.data.HideDirectionalEditorToolData;
 import com.makomi.data.NodeFaceSetBlockStateSupport;
 import java.util.List;

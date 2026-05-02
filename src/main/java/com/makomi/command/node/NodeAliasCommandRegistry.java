@@ -6,7 +6,6 @@ import com.makomi.data.LinkNodeSemantics;
 import com.makomi.data.LinkNodeType;
 import com.makomi.data.NodeAliasDisplayUtil;
 import com.makomi.data.NodeAliasSavedData;
-import com.makomi.data.NodeAliasServerSupport;
 import com.makomi.data.NodeIdentitySnapshot;
 import com.makomi.data.RepeaterAliasMirrorSupport;
 import com.makomi.data.LinkSavedData;
