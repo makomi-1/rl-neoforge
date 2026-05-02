@@ -1,0 +1,4 @@
+interface:
+  display_name: "Docs Dev 文档工作流"
+  short_description: "基于聊天记录的 docs_dev 自动更新与审查/测试提醒"
+  default_prompt: "Use $docs-dev-docflow to apply docs_dev 文档自动更新指引并索要审查、测试与经验内容。"
