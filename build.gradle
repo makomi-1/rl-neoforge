@@ -156,9 +156,92 @@ tasks.withType(JavaCompile).configureEach {
 
 tasks.named("test", Test).configure {
     dependsOn syncJUnitWorkspace
+    description = "Run stable core contract tests (default verification gate)."
+    maxParallelForks = 1
     useJUnitPlatform {
         includeTags "stable-core"
     }
+}
+
+def junitGameDir = layout.buildDirectory.dir("minecraft-junit")
+def junitProgramArgsFile = layout.buildDirectory.file("moddev/junit/programArgs.txt")
+def junitVmArgsFile = layout.buildDirectory.file("moddev/junit/vmArgs.txt")
+def buildJUnitModFolders = {
+    List<String> entries = []
+    sourceSets.main.output.classesDirs.files.each { entries.add("${mod_id}%%${it.absolutePath}") }
+    if (sourceSets.main.output.resourcesDir != null) {
+        entries.add("${mod_id}%%${sourceSets.main.output.resourcesDir.absolutePath}")
+    }
+    sourceSets.test.output.classesDirs.files.each { entries.add("${mod_id}%%${it.absolutePath}") }
+    if (sourceSets.test.output.resourcesDir != null) {
+        entries.add("${mod_id}%%${sourceSets.test.output.resourcesDir.absolutePath}")
+    }
+    entries.join(';')
+}
+
+def taggedTestTasks = [
+    [name: "testIntegration", tag: "integration", description: "Run integration tests (non-default gate)."],
+    [name: "testClient", tag: "client", description: "Run client-only tests (non-default gate)."],
+    [name: "testSlow", tag: "slow", description: "Run slow regression tests (non-default gate)."]
+]
+
+taggedTestTasks.each { config ->
+    tasks.register(config.name, Test) {
+        group = "verification"
+        description = config.description
+        dependsOn(
+            syncJUnitWorkspace,
+            tasks.named("downloadAssets"),
+            tasks.named("writeNeoForgeTestClasspath"),
+            tasks.named("prepareNeoForgeTestFiles")
+        )
+        testClassesDirs = sourceSets.test.output.classesDirs
+        classpath = sourceSets.test.runtimeClasspath
+        workingDir = junitGameDir.get().asFile
+        maxParallelForks = 1
+        systemProperty 'fml.junit.argsfile', junitProgramArgsFile.get().asFile.absolutePath
+        systemProperty 'fml.modFolders', buildJUnitModFolders()
+        jvmArgs("@${junitVmArgsFile.get().asFile.absolutePath}")
+        shouldRunAfter(tasks.named("test"))
+        useJUnitPlatform {
+            includeTags config.tag
+        }
+        if (config.tag == "slow") {
+            // NeoForge forgejunitdev 的启动与 FML 初始化会放大慢测抖动，这里只在任务层放宽口径，不改测试源码默认基线。
+            systemProperty 'redstonelink.test.slow.saveMs', '60'
+            systemProperty 'redstonelink.test.slow.loadMs', '60'
+            systemProperty 'redstonelink.test.slow.queryMs', '10'
+        }
+    }
+}
+
+tasks.register("testExtended") {
+    group = "verification"
+    description = "Run stable-core plus non-default suites."
+    dependsOn(
+        tasks.named("test"),
+        tasks.named("testIntegration"),
+        tasks.named("testClient"),
+        tasks.named("testSlow")
+    )
+}
+
+tasks.register("testStableCore") {
+    group = "verification"
+    description = "Alias entry for stable core contract suite."
+    dependsOn(tasks.named("test"))
+}
+
+tasks.named("testIntegration").configure {
+    shouldRunAfter(tasks.named("test"))
+}
+
+tasks.named("testClient").configure {
+    shouldRunAfter(tasks.named("testIntegration"))
+}
+
+tasks.named("testSlow").configure {
+    shouldRunAfter(tasks.named("testClient"))
 }
 
 idea {
