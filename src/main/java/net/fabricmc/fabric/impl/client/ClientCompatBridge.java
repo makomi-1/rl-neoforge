@@ -1,9 +1,10 @@
 package net.fabricmc.fabric.impl.client;
 
+import com.makomi.RedstoneLinkClient;
 import com.mojang.blaze3d.vertex.PoseStack;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
-import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderContext;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
 import net.fabricmc.fabric.api.event.player.AttackBlockCallback;
@@ -12,40 +13,82 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.client.renderer.MultiBufferSource;
 import net.minecraft.world.InteractionResult;
-import net.neoforged.neoforge.common.NeoForge;
+import net.neoforged.bus.api.IEventBus;
 import net.neoforged.neoforge.client.event.ClientChatReceivedEvent;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
+import net.neoforged.neoforge.client.event.EntityRenderersEvent;
+import net.neoforged.neoforge.client.event.RegisterClientCommandsEvent;
+import net.neoforged.neoforge.client.event.RegisterKeyMappingsEvent;
+import net.neoforged.neoforge.client.event.RegisterMenuScreensEvent;
+import net.neoforged.neoforge.client.event.RenderGuiEvent;
 import net.neoforged.neoforge.client.event.RenderHighlightEvent;
 import net.neoforged.neoforge.client.event.RenderLevelStageEvent;
+import net.neoforged.neoforge.common.NeoForge;
+import net.neoforged.neoforge.event.GameShuttingDownEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerInteractEvent;
 
-/**
- * 使用 NeoForge 事件总线驱动 Fabric 客户端兼容事件。
- */
 public final class ClientCompatBridge {
     private static boolean registered;
+    private static boolean initialized;
 
     private ClientCompatBridge() {
     }
 
-    public static synchronized void register() {
+    public static synchronized void register(IEventBus modEventBus) {
         if (registered) {
             return;
         }
         registered = true;
+        modEventBus.addListener(ClientCompatBridge::onRegisterMenuScreens);
+        modEventBus.addListener(ClientCompatBridge::onRegisterKeyMappings);
+        modEventBus.addListener(ClientCompatBridge::onRegisterBlockEntityRenderers);
+        NeoForge.EVENT_BUS.addListener(ClientCompatBridge::onRegisterClientCommands);
         NeoForge.EVENT_BUS.addListener(ClientCompatBridge::onClientTickPost);
         NeoForge.EVENT_BUS.addListener(ClientCompatBridge::onClientChatReceived);
         NeoForge.EVENT_BUS.addListener(ClientCompatBridge::onLeftClickBlock);
         NeoForge.EVENT_BUS.addListener(ClientCompatBridge::onRightClickBlock);
         NeoForge.EVENT_BUS.addListener(ClientCompatBridge::onRenderBlockOutline);
         NeoForge.EVENT_BUS.addListener(ClientCompatBridge::onRenderLevelStage);
+        NeoForge.EVENT_BUS.addListener(ClientCompatBridge::onRenderGuiPost);
+        NeoForge.EVENT_BUS.addListener(ClientCompatBridge::onGameShuttingDown);
+    }
+
+    private static synchronized void ensureClientInitialized() {
+        if (initialized) {
+            return;
+        }
+        initialized = true;
+        new RedstoneLinkClient().onInitializeClient();
+        NeoForgeClientRegistries.bootstrapRenderLayers();
+    }
+
+    private static void onRegisterMenuScreens(RegisterMenuScreensEvent event) {
+        ensureClientInitialized();
+        NeoForgeClientRegistries.fireRegisterMenuScreens(event);
+    }
+
+    private static void onRegisterKeyMappings(RegisterKeyMappingsEvent event) {
+        ensureClientInitialized();
+        NeoForgeClientRegistries.fireRegisterKeyMappings(event);
+    }
+
+    private static void onRegisterBlockEntityRenderers(EntityRenderersEvent.RegisterRenderers event) {
+        ensureClientInitialized();
+        NeoForgeClientRegistries.fireRegisterBlockEntityRenderers(event);
+    }
+
+    private static void onRegisterClientCommands(RegisterClientCommandsEvent event) {
+        ensureClientInitialized();
+        NeoForgeClientRegistries.fireRegisterClientCommands(event);
     }
 
     private static void onClientTickPost(ClientTickEvent.Post event) {
+        ensureClientInitialized();
         ClientTickEvents.fireEndClientTick(Minecraft.getInstance());
     }
 
     private static void onClientChatReceived(ClientChatReceivedEvent event) {
+        ensureClientInitialized();
         boolean overlay = event instanceof ClientChatReceivedEvent.System systemEvent && systemEvent.isOverlay();
         ClientReceiveMessageEvents.fireGame(event.getMessage(), overlay);
     }
@@ -75,6 +118,7 @@ public final class ClientCompatBridge {
     }
 
     private static void onRenderBlockOutline(RenderHighlightEvent.Block event) {
+        ensureClientInitialized();
         Minecraft minecraft = Minecraft.getInstance();
         if (minecraft.level == null) {
             return;
@@ -98,6 +142,7 @@ public final class ClientCompatBridge {
     }
 
     private static void onRenderLevelStage(RenderLevelStageEvent event) {
+        ensureClientInitialized();
         if (
             event.getStage() != RenderLevelStageEvent.Stage.AFTER_TRANSLUCENT_BLOCKS
                 && event.getStage() != RenderLevelStageEvent.Stage.AFTER_LEVEL
@@ -116,8 +161,15 @@ public final class ClientCompatBridge {
         consumers.endBatch();
     }
 
-    public static void dispatchClientPayload(net.minecraft.network.protocol.common.custom.CustomPacketPayload payload) {
-        ClientPlayNetworking.PlayPayloadHandler<net.minecraft.network.protocol.common.custom.CustomPacketPayload> handler =
-            null;
+    private static void onRenderGuiPost(RenderGuiEvent.Post event) {
+        ensureClientInitialized();
+        NeoForgeClientRegistries.fireHudRenderers(event.getGuiGraphics(), event.getPartialTick());
+    }
+
+    private static void onGameShuttingDown(GameShuttingDownEvent event) {
+        if (!initialized) {
+            return;
+        }
+        ClientLifecycleEvents.CLIENT_STOPPING.fire(Minecraft.getInstance());
     }
 }

@@ -64,8 +64,13 @@ public class RedstoneLink {
     public RedstoneLink(IEventBus modEventBus, ModContainer modContainer) {
         modEventBus.addListener(ArgumentTypeRegistry::bootstrap);
         modEventBus.addListener(PayloadTypeRegistry::bootstrap);
+        ModBlocks.register(modEventBus);
+        ModBlockEntities.register(modEventBus);
+        ModItems.register(modEventBus);
+        ModMenuTypes.register(modEventBus);
+        ModItemGroups.register(modEventBus);
         if (FMLEnvironment.dist.isClient()) {
-            ClientCompatBridge.register();
+            ClientCompatBridge.register(modEventBus);
         }
 
         NeoForge.EVENT_BUS.addListener((RegisterCommandsEvent event) -> CommandRegistrationCallback.EVENT.fire(event));
@@ -116,11 +121,6 @@ public class RedstoneLink {
         ChunkActivatorNetwork.register();
         RepeaterNetwork.register();
         SmartNodeContainerNetwork.register();
-        ModBlocks.register();
-        ModBlockEntities.register();
-        ModItems.register();
-        ModMenuTypes.register();
-        ModItemGroups.register();
         ModCommandArgumentTypes.register();
         ModCommands.register();
         InternalDispatchDeltaProjector.register();

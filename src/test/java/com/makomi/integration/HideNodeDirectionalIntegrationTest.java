@@ -766,6 +766,24 @@ class HideNodeDirectionalIntegrationTest {
 		public float getShade(Direction direction, boolean shaded) {
 			return 1.0F;
 		}
+
+		@Override
+		public void setDayTimePerTick(float dayTimePerTick) {
+		}
+
+		@Override
+		public float getDayTimePerTick() {
+			return 0.0F;
+		}
+
+		@Override
+		public float getDayTimeFraction() {
+			return 0.0F;
+		}
+
+		@Override
+		public void setDayTimeFraction(float dayTimeFraction) {
+		}
 	}
 
 	/**

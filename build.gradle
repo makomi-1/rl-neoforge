@@ -87,9 +87,14 @@ neoForge {
 
 configurations {
     runtimeClasspath.extendsFrom localRuntime
+    testCompileClasspath.extendsFrom compileClasspath
+    testRuntimeClasspath.extendsFrom runtimeClasspath
 }
 
 dependencies {
+    testImplementation platform("org.junit:junit-bom:5.10.2")
+    testImplementation "org.junit.jupiter:junit-jupiter"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher"
 }
 
 def generateModMetadata = tasks.register("generateModMetadata", ProcessResources) {
@@ -132,6 +137,12 @@ publishing {
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
+}
+
+tasks.named("test", Test).configure {
+    useJUnitPlatform {
+        includeTags "stable-core"
+    }
 }
 
 idea {
