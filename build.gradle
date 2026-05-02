@@ -83,6 +83,11 @@ neoForge {
             sourceSet(sourceSets.main)
         }
     }
+
+    unitTest {
+        testedMod = mods.named("${mod_id}")
+        enable()
+    }
 }
 
 configurations {
@@ -95,6 +100,16 @@ dependencies {
     testImplementation platform("org.junit:junit-bom:5.10.2")
     testImplementation "org.junit.jupiter:junit-jupiter"
     testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+}
+
+def syncJUnitWorkspace = tasks.register("syncJUnitWorkspace", Sync) {
+    into layout.buildDirectory.dir("minecraft-junit/src")
+    from("src/main") {
+        into "main"
+    }
+    from("src/test/resources") {
+        into "test/resources"
+    }
 }
 
 def generateModMetadata = tasks.register("generateModMetadata", ProcessResources) {
@@ -140,6 +155,7 @@ tasks.withType(JavaCompile).configureEach {
 }
 
 tasks.named("test", Test).configure {
+    dependsOn syncJUnitWorkspace
     useJUnitPlatform {
         includeTags "stable-core"
     }
